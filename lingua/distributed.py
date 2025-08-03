@@ -36,7 +36,13 @@ from lingua.float8 import convert_linears_to_fp8
 
 logger = logging.getLogger()
 
-
+default_no_recompute_ops = {
+    torch.ops.aten.mm.default,
+    torch.ops.aten._scaled_mm.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.c10d_functional.reduce_scatter_tensor.default,
+}
 
 @dataclass
 class DistributedArgs:
