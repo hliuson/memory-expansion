@@ -73,6 +73,10 @@ class HashingMemory(nn.Module):
         # architecture
         peer_variant=False,  # Replaces the PK memory with the PEER variant (Parameter Efficient Expert Retrieval)
         swilu_projection=True,
+        # --- START NEW PARAMETERS ---
+        mem_n_keys_row: Optional[int] = None, # New: Explicit row key count
+        mem_n_keys_col: Optional[int] = None, # New: Explicit column key count
+        # --- END NEW PARAMETERS ---
     ):
         # Check parameters
         # even number of key dimensions for product quantization
@@ -105,8 +109,19 @@ class HashingMemory(nn.Module):
         # global parameters
         self.input_dim = input_dim
         self.output_dim = output_dim
+
+        # --- START CHANGES FOR KEY SIZES ---
+        # Set row and column key counts
+        self.mem_n_keys_row = mem_n_keys_row if mem_n_keys_row is not None else mem_n_keys
+        self.mem_n_keys_col = mem_n_keys_col if mem_n_keys_col is not None else mem_n_keys
+
         # number of indices / entries in the memory
-        self.size = mem_n_keys**2
+        # This will now be the product of row and column key counts
+        self.size = self.mem_n_keys_row * self.mem_n_keys_col
+        # --- END CHANGES FOR KEY SIZES ---
+
+        # number of indices / entries in the memory
+        # self.size = mem_n_keys**2
         self.k_dim = mem_k_dim
 
         self.v_dim = mem_v_dim if mem_v_dim > 0 else output_dim
@@ -122,10 +137,17 @@ class HashingMemory(nn.Module):
         self.query_dropout = mem_query_dropout
         self.value_dropout = mem_value_dropout
 
+        # --- START CHANGES FOR KEY PARAMETER INITIALIZATION ---
+        # Initialize keys: This needs to be two separate parameters now.
+        # Original: self.keys = nn.Parameter(torch.empty(2 * self.heads * int(self.size**0.5), self.k_dim // 2))
+        self.keys1 = nn.Parameter(torch.empty(self.heads * self.mem_n_keys_row, self.k_dim // 2))
+        self.keys2 = nn.Parameter(torch.empty(self.heads * self.mem_n_keys_col, self.k_dim // 2))
+        # --- END CHANGES FOR KEY PARAMETER INITIALIZATION ---
+
         # initialize keys
-        self.keys = nn.Parameter(
-            torch.empty(2 * self.heads * int(self.size**0.5), self.k_dim // 2)
-        )
+        # self.keys = nn.Parameter(
+        #     torch.empty(2 * self.heads * int(self.size**0.5), self.k_dim // 2)
+        # )
 
         # optionally use the same values for all memories
         self.mem_share_values = mem_share_values
@@ -211,21 +233,53 @@ class HashingMemory(nn.Module):
                 self.values_v = fully_shard(
                     self.values_v, **fsdp_config, reshard_after_forward=False
                 )
+            
+            # --- START NEW FSDP SHARDING FOR KEYS ---
+            # If you want to FSDP shard keys1 and keys2:
+            self.keys1 = fully_shard(
+                self.keys1, **fsdp_config, reshard_after_forward=False
+            )
+            self.keys2 = fully_shard(
+                self.keys2, **fsdp_config, reshard_after_forward=False
+            )
+            # --- END NEW FSDP SHARDING FOR KEYS ---
+
         if self.mem_share_values and self.original:
             if not self.use_peer_variant:
                 HashingMemory.VALUES = self.values
             else:
                 HashingMemory.VALUES = self.values_u, self.values_v
+            
+            # --- START NEW GLOBAL KEY STORAGE ---
+            # If you share keys across memories, they should be stored globally too
+            HashingMemory.KEYS1 = self.keys1
+            HashingMemory.KEYS2 = self.keys2
+            # --- END NEW GLOBAL KEY STORAGE ---
+
         if self.mem_share_values and not self.original:
             if not self.use_peer_variant:
                 self.values = HashingMemory.VALUES
             else:
                 self.values_u, self.values_v = HashingMemory.VALUES
+            
+            # --- START NEW GLOBAL KEY RETRIEVAL ---
+            # If you share keys across memories, retrieve them from global storage
+            self.keys1 = HashingMemory.KEYS1
+            self.keys2 = HashingMemory.KEYS2
+            # --- END NEW GLOBAL KEY RETRIEVAL ---
 
     def reset_parameters(self, init_std=None, factor=1.0):
         # keys
-        bound = 1 / math.sqrt(self.k_dim)
-        nn.init.uniform_(self.keys, a=-bound, b=bound)
+        # bound = 1 / math.sqrt(self.k_dim)
+        # nn.init.uniform_(self.keys, a=-bound, b=bound)
+
+        # keys
+        # --- START CHANGES FOR reset_parameters ---
+        bound = 1 / math.sqrt(self.k_dim // 2) # bound is for the half-dimension
+        nn.init.uniform_(self.keys1, a=-bound, b=bound)
+        nn.init.uniform_(self.keys2, a=-bound, b=bound)
+        # --- END CHANGES FOR reset_parameters ---
+
         # values
         if self.original:
             if not self.use_peer_variant:
@@ -334,10 +388,20 @@ class HashingMemory(nn.Module):
         half = self.k_dim // 2
         # keys : (heads, 2, n_keys, half)
         # keys1 : (heads, n_keys, half)
-        keys = self.keys.view(self.heads, 2, -1, half)
-        keys1 = keys[:, 0, :, :]
-        keys2 = keys[:, 1, :, :]
-        n_keys = len(keys[0][0])
+        # keys = self.keys.view(self.heads, 2, -1, half)
+        # keys1 = keys[:, 0, :, :]
+        # keys2 = keys[:, 1, :, :]
+        # n_keys = len(keys[0][0])
+        # n_keys from keys[0][0] might be n_keys1
+        # n_keys1 = len(keys[:, 0, :, :][0])
+        # n_keys2 = len(keys[:, 1, :, :][0]) 
+
+        # --- START NEW/MODIFIED LINES ---
+        # Use the separate key parameters (self.keys1 and self.keys2)
+        # and their respective dimensions (self.mem_n_keys_row, self.mem_n_keys_col)
+        keys1 = self.keys1.view(self.heads, self.mem_n_keys_row, half) # Change: Use self.keys1 and self.mem_n_keys_row
+        keys2 = self.keys2.view(self.heads, self.mem_n_keys_col, half) # Change: Use self.keys2 and self.mem_n_keys_col
+        # --- END NEW/MODIFIED LINES ---
 
         # split query for product quantization
         q1 = query[:, :, :half]  # (bs, heads, half)
@@ -361,13 +425,50 @@ class HashingMemory(nn.Module):
         ).view(
             bs, self.heads, -1
         )  # (bs, heads, knn ** 2)
+        # all_indices = (
+        #     indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+        #     * n_keys
+        #     + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        # ).view(
+        #     bs, self.heads, -1
+        # )  # (bs, heads, knn ** 2)
+        # all_indices = (
+        # indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+        # * n_keys1 # This is the key change: use n_keys1 here, not n_keys (which was int(self.size**0.5))
+        # + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        # ).view(
+        #     bs, self.heads, -1
+        # )
+
+        # --- START MODIFIED LINE ---
+        # Original commented out block:
+        # all_indices = (
+        #     indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+        #     * n_keys
+        #     + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        # ).view(
+        #     bs, self.heads, -1
+        # )
+
+        # Your current proposed line:
+        # all_indices = (
+        # indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+        # * n_keys1 # This is the key change: use n_keys1 here, not n_keys (which was int(self.size**0.5))
+        # + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        # ).view(
+        #     bs, self.heads, -1
+        # )
+
+        # The correct change should use self.mem_n_keys_col to multiply indices1
+        # because that's the base of the column dimension.
         all_indices = (
             indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
-            * n_keys
+            * self.mem_n_keys_col  # CHANGE: Use self.mem_n_keys_col here
             + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
         ).view(
             bs, self.heads, -1
-        )  # (bs, heads, knn ** 2)
+        )
+        # --- END MODIFIED LINE ---
 
         # select overall best scores and indices
         scores, best_indices = torch.topk(
