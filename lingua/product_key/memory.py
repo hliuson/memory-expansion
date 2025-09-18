@@ -46,10 +46,7 @@ class MultipleHashingMemory(nn.Module):
     def __init__(self, input_dim, output_dim, productkey_args: List[ProductKeyArgs]):
         super().__init__()
         self.memories = nn.ModuleList()
-        self.layers = []
         for args in productkey_args:
-            assert args.is_enabled
-            self.layers.append([int(l) for l in args.layers.split(",")])
             self.memories.append(
                 HashingMemory(
                     input_dim,
@@ -120,6 +117,15 @@ class MultipleHashingMemory(nn.Module):
 
         # Use first memory to aggregate and project
         return mem0.aggregate_from_indices(x0, top_scores.view(bs * h, -1), top_indices.view(bs * h, -1), bs, B, T)
+
+    def mp_parallelize(self, mesh, model_args, distributed_args, param_dtype):
+        """Parallelize all underlying HashingMemory modules consistently.
+
+        This delegates to each memory's mp_parallelize so that value tables
+        get sharded/parallelized properly and shared when configured.
+        """
+        for m in self.memories:
+            m.mp_parallelize(mesh, model_args, distributed_args, param_dtype)
 
     def reset_parameters(self, init_std=None, factor=1.0):
         for m in self.memories:
@@ -466,41 +472,6 @@ class HashingMemory(nn.Module):
         ).reshape(bs, self.heads, -1)
 
         return all_scores.view(bs * self.heads, -1), all_indices.view(bs * self.heads, -1)
-
-    def fetch_values(self, keys: torch.Tensor):
-        """Fetch raw value vectors for the given keys.
-
-        Args:
-            keys: LongTensor of shape (...,) or (..., K)
-        Returns:
-            If PK variant: Tensor of shape (..., v_dim)
-            If PEER variant: Tuple(Tensor, Tensor) each of shape (..., v_dim)
-        """
-        if not self.use_peer_variant:
-            # Access local tensor if sharded
-            values_tbl = self.values if self.values is not None else HashingMemory.VALUES
-            assert values_tbl is not None, "Values are not initialized"
-            weight = values_tbl.weight
-            if hasattr(weight, "to_local"):
-                try:
-                    local = weight.to_local()
-                    num_shards = weight.device_mesh.size()
-                    if num_shards > 1:
-                        grad_scale = 1 / num_shards
-                        local = local * grad_scale + (local * (1 - grad_scale)).detach()
-                    weight = local
-                except Exception:
-                    # Not a DTensor
-                    pass
-            return weight.index_select(0, keys.view(-1)).view(*keys.shape, self.v_dim)
-        else:
-            u_tbl = self.values_u
-            v_tbl = self.values_v
-            return (
-                u_tbl.weight.index_select(0, keys.view(-1)).view(*keys.shape, self.v_dim),
-                v_tbl.weight.index_select(0, keys.view(-1)).view(*keys.shape, self.v_dim),
-            )
-
 
 class QueryMLP(nn.Module):
     def __init__(self, input_dim, heads, k_dim, sizes, bias=False, batchnorm=False):

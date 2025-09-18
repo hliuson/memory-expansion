@@ -505,7 +505,7 @@ class TransformerBlock(nn.Module):
             self.feed_forward = MultipleHashingMemory(
                 input_dim = args.dim,
                 output_dim = args.dim,
-                productkey_args = [args.productkey_args],
+                productkey_args = [args.productkey_args, args.productkey_args], #test with 2 memories
             )
         else:
             self.feed_forward = FeedForward(
