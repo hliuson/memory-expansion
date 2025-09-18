@@ -1,4 +1,4 @@
-# dump_dir: !!!CHANGE_THIS!!!
+dump_dir: /workspace/memory-expansion/outputs/llama_1B
 name: large_lm
 steps: 60_000
 probe_freq: null
@@ -25,9 +25,9 @@ model:
   n_heads: 16
 
 data:
-  root_dir: data/shuffled
+  root_dir: /workspace/memory-expansion/data
   sources:
-    dclm_baseline_1.0: 100.0
+    fineweb_edu_10bt_shuffled: 100.0
   batch_size: 4
   prefetch_size: 1024
   seq_len: 4096
@@ -37,7 +37,7 @@ data:
   add_eos: true
   tokenizer:
     name: tiktoken
-    path: tokenizers/cl_toplang_128k.tiktoken
+    path: /workspace/memory-expansion/model/original/tokenizer.model
 
 profiling:
   run: true
@@ -56,6 +56,10 @@ checkpoint:
 
 logging:
   freq: 1
+  wandb:
+    project: "large-lm"
+    mode: "online"
+    resume: "allow" 
 
 async_eval_gpus: 8
 eval:
