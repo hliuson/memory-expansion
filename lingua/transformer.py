@@ -16,7 +16,7 @@ from torch.nn.attention.flex_attention import (
 
 from lingua import probe
 
-from lingua.product_key.memory import HashingMemory, ProductKeyArgs
+from lingua.product_key.memory import HashingMemory, ProductKeyArgs, MultipleHashingMemory
 
 flex_attention_comp = torch.compile(flex_attention)
 
@@ -502,19 +502,10 @@ class TransformerBlock(nn.Module):
         )
         pk_layers = [int(s) for s in args.productkey_args.layers.split(",") if len(s)>0]
         if args.productkey_args.is_enabled and layer in pk_layers:
-            self.feed_forward = HashingMemory(
+            self.feed_forward = MultipleHashingMemory(
                 input_dim = args.dim,
                 output_dim = args.dim,
-                mem_n_keys = args.productkey_args.mem_n_keys,
-                mem_heads= args.productkey_args.mem_heads,
-                mem_knn= args.productkey_args.mem_knn,
-                mem_share_values= args.productkey_args.mem_share_values,
-                mem_k_dim= args.productkey_args.mem_k_dim,
-                mem_v_dim = args.productkey_args.mem_v_dim,
-                swilu_projection= args.productkey_args.swilu_projection,
-                value_fixed_lr= args.productkey_args.value_fixed_lr,
-                mem_gated = args.productkey_args.mem_gated,
-                peer_variant = args.productkey_args.peer_variant,
+                productkey_args = [args.productkey_args],
             )
         else:
             self.feed_forward = FeedForward(
