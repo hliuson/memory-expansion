@@ -65,6 +65,7 @@ from apps.main.transformer import (
     tp_parallelize,
     get_no_recompute_ops,
 )
+from lingua.product_key.memory import HashingMemory, MultipleHashingMemory
 from lingua.probe import AutoProbeD
 from lingua.stool import StoolArgs, launch_job
 
@@ -218,6 +219,43 @@ def every_n_steps(train_state, freq, acc_step=None, acc_freq=None):
     return test
 
 
+def freeze_all_except_memory(model):
+    """Freeze all parameters except those in memory layers (HashingMemory or MultipleHashingMemory).
+    
+    This is used for fine-tuning where we only want to update the memory layers.
+    """
+    frozen_count = 0
+    trainable_count = 0
+    
+    # Get all modules in the model
+    all_modules = dict(model.named_modules())
+    
+    for name, param in model.named_parameters():
+        # Check if this parameter belongs to a memory layer
+        is_memory_param = False
+        
+        # Check if the parameter is in a HashingMemory or MultipleHashingMemory module
+        # by checking all parent modules in the parameter's path
+        parts = name.split('.')
+        for i in range(len(parts)):
+            module_path = '.'.join(parts[:i+1])
+            if module_path in all_modules:
+                module = all_modules[module_path]
+                if isinstance(module, (HashingMemory, MultipleHashingMemory)):
+                    is_memory_param = True
+                    break
+        
+        if is_memory_param:
+            param.requires_grad = True
+            trainable_count += param.numel()
+        else:
+            param.requires_grad = False
+            frozen_count += param.numel()
+    
+    logger.info(f"Frozen {frozen_count:,} parameters, {trainable_count:,} trainable (memory layers only)")
+    return frozen_count, trainable_count
+
+
 def train(args: TrainArgs):
     with ExitStack() as context_stack:
         tokenizer = build_tokenizer(args.data.tokenizer.name, args.data.tokenizer.path)
@@ -275,9 +313,32 @@ def train(args: TrainArgs):
         # which will silently fail (give nan gradients for example)
 
         if args.checkpoint.init_ckpt_path:
-            st_dict = torch.load(args.checkpoint.init_ckpt_path)
-            model.load_state_dict(st_dict)
+            logger.info(f"Loading pre-trained model from: {args.checkpoint.init_ckpt_path}")
+            st_dict = torch.load(args.checkpoint.init_ckpt_path, weights_only=True)
+            # Use strict=False to handle cases where pre-trained model doesn't have memory layers
+            # or has different architecture. Missing keys (like new memory layers) will be initialized randomly.
+            missing_keys, unexpected_keys = model.load_state_dict(st_dict, strict=False)
+            if missing_keys:
+                logger.info(f"Missing keys (will be initialized randomly): {len(missing_keys)} keys")
+                if len(missing_keys) <= 10:
+                    for key in missing_keys:
+                        logger.info(f"  - {key}")
+                else:
+                    logger.info(f"  (showing first 10 of {len(missing_keys)} missing keys)")
+                    for key in missing_keys[:10]:
+                        logger.info(f"  - {key}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys (will be ignored): {len(unexpected_keys)} keys")
+                if len(unexpected_keys) <= 10:
+                    for key in unexpected_keys:
+                        logger.warning(f"  - {key}")
+                else:
+                    logger.warning(f"  (showing first 10 of {len(unexpected_keys)} unexpected keys)")
+                    for key in unexpected_keys[:10]:
+                        logger.warning(f"  - {key}")
+            logger.info("Pre-trained model loaded successfully")
         else:
+            logger.info("Initializing model from scratch (no pre-trained checkpoint provided)")
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 torch.manual_seed(args.model.seed + get_global_rank())
                 model.init_weights()
@@ -286,6 +347,10 @@ def train(args: TrainArgs):
         # log model size
 
         logger.info(f"Model size: {model_param_count:,} total parameters")
+
+        # Freeze all parameters except memory layers for fine-tuning
+        logger.info("Freezing all parameters except memory layers for fine-tuning")
+        freeze_all_except_memory(model)
 
         gpu_memory_monitor = GPUMemoryMonitor("cuda")
         logger.info(

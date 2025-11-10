@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from logging import getLogger
 import math
-from typing import Optional
+from typing import Optional, List
 from dataclasses import dataclass
 import numpy as np
 import torch
@@ -40,6 +40,96 @@ class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
+
+
+class MultipleHashingMemory(nn.Module):
+    def __init__(self, input_dim, output_dim, productkey_args: List[ProductKeyArgs]):
+        super().__init__()
+        self.memories = nn.ModuleList()
+        for args in productkey_args:
+            self.memories.append(
+                HashingMemory(
+                    input_dim,
+                    output_dim,
+                    mem_n_keys=args.mem_n_keys,
+                    mem_heads=args.mem_heads,
+                    mem_knn=args.mem_knn,
+                    mem_share_values=args.mem_share_values,
+                    mem_k_dim=args.mem_k_dim,
+                    mem_v_dim=args.mem_v_dim,
+                    swilu_projection=args.swilu_projection,
+                    value_fixed_lr=args.value_fixed_lr
+                    if args.value_fixed_lr is not None
+                    else 0.001,
+                    mem_gated=args.mem_gated,
+                    peer_variant=args.peer_variant,
+                )
+            )
+
+    def forward(self, input):
+        """Combine multiple HashingMemory modules by pooling their candidates and selecting global top-k.
+
+        Assumptions/scope:
+        - All sub-memories share the same value table (mem_share_values=True) and are PK (not PEER).
+        - heads, knn, k_dim, and size are identical across memories.
+        """
+        assert len(self.memories) > 0, "No memories configured"
+        mem0 = self.memories[0]
+        # Restrict to PK variant and shared values for now
+        for m in self.memories:
+            assert not m.use_peer_variant, "MultipleHashingMemory does not support PEER variant yet"
+        # Compute queries and candidates per memory uniformly
+        B, T, _ = input.shape
+        cand_scores_list = []
+        cand_indices_list = []
+        x0 = None
+        bs = None
+        h = mem0.heads
+        knn = mem0.knn
+        kdim = mem0.k_dim
+        for i, m in enumerate(self.memories):
+            q, x_flat, bs_i, B_i, T_i = m.compute_query(input)
+            if i == 0:
+                x0 = x_flat
+                bs = bs_i
+                # Validate compatibility using the first memory as reference
+                assert B_i == B and T_i == T
+            # Validate compatibility across memories
+            assert m.input_dim == mem0.input_dim
+            assert m.output_dim == mem0.output_dim
+            assert m.heads == h
+            assert m.knn == knn
+            assert m.k_dim == kdim
+            assert m.size == mem0.size
+            assert m.v_dim == mem0.v_dim
+            # select all candidate pairs (~ knn^2) and reshape to (bs, h, C)
+            scores_all, indices_all = m.select_candidates(q, knn)
+            cand_scores_list.append(scores_all.view(bs_i, h, -1))
+            cand_indices_list.append(indices_all.view(bs_i, h, -1))
+
+        # Concatenate candidates across memories along candidate dimension
+        all_scores = torch.cat(cand_scores_list, dim=2)
+        all_indices = torch.cat(cand_indices_list, dim=2)
+
+        # Global top-k across all memories per head
+        top_scores, top_pos = torch.topk(all_scores, k=knn, dim=2, largest=True, sorted=True)
+        top_indices = all_indices.gather(2, top_pos)
+
+        # Use first memory to aggregate and project
+        return mem0.aggregate_from_indices(x0, top_scores.view(bs * h, -1), top_indices.view(bs * h, -1), bs, B, T)
+
+    def mp_parallelize(self, mesh, model_args, distributed_args, param_dtype):
+        """Parallelize all underlying HashingMemory modules consistently.
+
+        This delegates to each memory's mp_parallelize so that value tables
+        get sharded/parallelized properly and shared when configured.
+        """
+        for m in self.memories:
+            m.mp_parallelize(mesh, model_args, distributed_args, param_dtype)
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        for m in self.memories:
+            m.reset_parameters(init_std=init_std, factor=factor)
 
 
 class HashingMemory(nn.Module):
@@ -262,28 +352,36 @@ class HashingMemory(nn.Module):
         """
         Read from the memory.
         """
-        B, T, C = input.shape
-        input = input.view(-1, self.input_dim)
-
-        # input dimensions
-        assert input.shape[-1] == self.input_dim
-        prefix_shape = input.shape[:-1]
-
-        # compute query / store it
-        bs = np.prod(prefix_shape)
-        input = F.dropout(
-            input, p=self.input_dropout, training=self.training
-        )  # input shape
-        query = self.query_proj(input)  # (bs * heads, k_dim)
-        query = F.dropout(
-            query, p=self.query_dropout, training=self.training
-        )  # (bs * heads, k_dim)
-        assert query.shape == (bs * self.heads, self.k_dim)
+        query, input_flat, bs, B, T = self.compute_query(input)
 
         # get indices
         knn = self.knn
         scores, indices = self.get_indices(query, knn)  # (bs * heads, knn) ** 2
 
+        return self.aggregate_from_indices(input_flat, scores, indices, bs, B, T)
+
+    def compute_query(self, input: torch.Tensor):
+        """Prepare flattened input and compute query embeddings for this memory.
+
+        Returns: (query, input_flat, bs, B, T)
+        """
+        B, T, C = input.shape
+        input_flat = input.view(-1, self.input_dim)
+        assert input_flat.shape[-1] == self.input_dim
+        prefix_shape = input_flat.shape[:-1]
+        bs = int(np.prod(prefix_shape))
+        input_flat = F.dropout(input_flat, p=self.input_dropout, training=self.training)
+        query = self.query_proj(input_flat)
+        query = F.dropout(query, p=self.query_dropout, training=self.training)
+        assert query.shape == (bs * self.heads, self.k_dim)
+        return query, input_flat, bs, B, T
+
+    def aggregate_from_indices(self, input_flat: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor, bs: int, B: int, T: int):
+        """Aggregate values using selected indices and scores and apply projections/gating.
+
+        Expects scores/indices shaped (bs*heads, knn).
+        """
+        knn = scores.size(-1)
         # store indices / scores (eval mode only - for usage statistics)
         if not self.training and HashingMemory.EVAL_MEMORY:
             self.last_indices = indices.view(bs, self.heads, knn).detach().cpu()
@@ -301,33 +399,47 @@ class HashingMemory(nn.Module):
             if self.v_proj and not self.swilu_proj:
                 output = self.value_proj(output)
             if self.swilu_proj:
-                output = self.value_proj(output * F.silu(self.swilu_projection(input)))
+                output = self.value_proj(output * F.silu(self.swilu_projection(input_flat)))
         else:
             u = self.values_u(indices)
-            x = torch.einsum(
-                "bh, blh->bl", input, u
-            )  # (bs, v_dim) , (bs, heads * knn, v_dim) -> (bs, heads * knn)
-            x = F.gelu(x)  # This can be either GeLU or ReLU
+            x = torch.einsum("bh, blh->bl", input_flat, u)
+            x = F.gelu(x)
             v = self.values_v(indices)
-            x = x * scores  # (bs, heads * knn)
-            output = torch.einsum(
-                "bl, blh->bh", x, v
-            )  # (bs, heads * knn) , (bs, heads * knn, v_dim) -> (bs, v_dim)
+            x = x * scores
+            output = torch.einsum("bl, blh->bh", x, v)
 
-        output = F.dropout(
-            output, p=self.value_dropout, training=self.training
-        )  # (bs, v_dim)
+        output = F.dropout(output, p=self.value_dropout, training=self.training)
 
-        # reshape output
-        if len(prefix_shape) >= 2:
-            output = output.view(prefix_shape + (self.v_dim,))  # (..., v_dim)
-
-        if self.gating:
-            output = F.sigmoid(self.gating(input)) * output
+        # reshape output to (B, T, v_dim)
         output = output.view(B, T, -1)
+        if self.gating is not None:
+            output = torch.sigmoid(self.gating(input_flat)).view(B, T, 1) * output
         return output
 
     def get_indices(self, query, knn):
+        # Use select_candidates then pick the final top-k per head
+        scores_all, indices_all = self.select_candidates(query, knn)
+        bs = (scores_all.shape[0]) // self.heads
+        # reshape to (bs, h, C)
+        scores_all = scores_all.view(bs, self.heads, -1)
+        indices_all = indices_all.view(bs, self.heads, -1)
+        scores, best_positions = torch.topk(
+            scores_all, k=knn, dim=2, largest=True, sorted=True
+        )
+        indices = indices_all.gather(2, best_positions)
+        assert scores.shape == indices.shape == (bs, self.heads, knn)
+        return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+
+    def select_candidates(self, query, knn):
+        """Return all knn^2 candidate scores and indices per query head before final top-k.
+
+        Args:
+            query: Tensor of shape (bs*heads, k_dim)
+            knn: number of nearest keys per half to combine
+        Returns:
+            scores_all: (bs*heads, knn*knn)
+            indices_all: (bs*heads, knn*knn)
+        """
         assert query.dim() == 2 and query.size(1) == self.k_dim
         bs = len(query) // self.heads
         query = query.view(-1, self.heads, self.k_dim)
@@ -337,47 +449,30 @@ class HashingMemory(nn.Module):
         keys = self.keys.view(self.heads, 2, -1, half)
         keys1 = keys[:, 0, :, :]
         keys2 = keys[:, 1, :, :]
-        n_keys = len(keys[0][0])
+        n_keys = keys1.shape[1]
 
         # split query for product quantization
-        q1 = query[:, :, :half]  # (bs, heads, half)
-        q2 = query[:, :, half:]  # (bs, heads, half)
+        q1 = query[:, :, :half]
+        q2 = query[:, :, half:]
 
-        # compute indices with associated scores
-        scores1 = torch.einsum(
-            "blh, lkh->blk", q1, keys1
-        )  # (bs , heads, n_keys ** 0,5)
-        scores2 = torch.einsum(
-            "blh, lkh->blk", q2, keys2
-        )  # (bs , heads, n_keys ** 0,5)
+        # compute scores against sub-keys and keep top-k per half
+        scores1 = torch.einsum("blh, lkh->blk", q1, keys1)
+        scores2 = torch.einsum("blh, lkh->blk", q2, keys2)
+        scores1, indices1 = scores1.topk(knn, dim=2, largest=True)
+        scores2, indices2 = scores2.topk(knn, dim=2, largest=True)
 
-        scores1, indices1 = scores1.topk(knn, dim=2, largest=True)  # (bs, heads, knn)
-        scores2, indices2 = scores2.topk(knn, dim=2, largest=True)  # (bs, heads, knn)
-
-        # cartesian product on best candidate keys
+        # Cartesian product of top candidates
         all_scores = (
             scores1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
             + scores2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
-        ).view(
-            bs, self.heads, -1
-        )  # (bs, heads, knn ** 2)
+        ).reshape(bs, self.heads, -1)
         all_indices = (
             indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
             * n_keys
             + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
-        ).view(
-            bs, self.heads, -1
-        )  # (bs, heads, knn ** 2)
+        ).reshape(bs, self.heads, -1)
 
-        # select overall best scores and indices
-        scores, best_indices = torch.topk(
-            all_scores, k=knn, dim=2, largest=True, sorted=True
-        )  # (bs, heads, knn)
-        indices = all_indices.gather(2, best_indices)  # (bs, knn)
-
-        # return scores with indices
-        assert scores.shape == indices.shape == (bs, self.heads, knn)
-        return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+        return all_scores.view(bs * self.heads, -1), all_indices.view(bs * self.heads, -1)
 
 
 class QueryMLP(nn.Module):
